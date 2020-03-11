@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -343,6 +344,14 @@ func (r *runner) CalculateScore(s *State) float64 {
 	if !s.IsTerminal() {
 		return r.CalculateMaxPotentialScore(s)
 	}
+
+	// For terminal states, return the lowest possible score if it doesn't meet minimum group size constraints
+	for i := 0; i < len(s.Groups); i++ {
+		if len(s.Groups[i].Items) > 0 && len(s.Groups[i].Items) < s.Groups[i].MinSize {
+			return -math.MaxFloat64
+		}
+	}
+
 	return r.CalculateCurrentScore(s)
 }
 

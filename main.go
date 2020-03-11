@@ -18,8 +18,7 @@ var itemsFile string
 var rulesFile string
 var groupsFile string
 
-// TODO
-//var minGroupSize int
+var minGroupSize int
 var maxGroupSize int
 var maxNumGroups int
 
@@ -27,7 +26,7 @@ func init() {
 	flag.StringVar(&itemsFile, "items", "", "path to the items to arrange")
 	flag.StringVar(&rulesFile, "rules", "", "path to the rules file")
 	flag.StringVar(&groupsFile, "groups", "", "path to the list of groups")
-	//flag.IntVar(&minGroupSize, "min-size", 1, "path to the rules file")
+	flag.IntVar(&minGroupSize, "min-size", 0, "path to the rules file")
 	flag.IntVar(&maxGroupSize, "max-size", 0, "maximum size of a group")
 	flag.IntVar(&maxNumGroups, "max-groups", 0, "maximum number of groups")
 }
@@ -54,7 +53,7 @@ func main() {
 		groups = readGroupsFromCSV(groupsFile)
 	} else {
 		for i := 0; i < maxNumGroups; i++ {
-			groups = append(groups, &Group{Name: fmt.Sprintf("Group %d", i+1), MaxSize: maxGroupSize})
+			groups = append(groups, &Group{Name: fmt.Sprintf("Group %d", i+1), MaxSize: maxGroupSize, MinSize: minGroupSize})
 		}
 	}
 

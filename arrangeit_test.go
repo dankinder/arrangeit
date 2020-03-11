@@ -176,3 +176,41 @@ func TestNearness(t *testing.T) {
 		},
 	)
 }
+
+func TestRespectMinSize(t *testing.T) {
+	assert.Equal(t,
+		[]*Group{
+			&Group{
+				Name: "Group 1",
+				Items: []*Item{
+					&Item{ID: "guy1", Tags: map[string]string{"gender": "m"}},
+					&Item{ID: "girl1", Tags: map[string]string{"gender": "f"}},
+					&Item{ID: "guy2", Tags: map[string]string{"gender": "m"}},
+					&Item{ID: "girl2", Tags: map[string]string{"gender": "f"}},
+				},
+				MinSize: 3,
+				MaxSize: 4,
+			},
+			&Group{
+				Name:    "Group 2",
+				Items:   []*Item{},
+				MinSize: 3,
+				MaxSize: 4,
+			},
+		},
+		MustGetArrangement(
+			[]*Item{
+				&Item{ID: "guy1", Tags: map[string]string{"gender": "m"}},
+				&Item{ID: "girl1", Tags: map[string]string{"gender": "f"}},
+				&Item{ID: "guy2", Tags: map[string]string{"gender": "m"}},
+				&Item{ID: "girl2", Tags: map[string]string{"gender": "f"}},
+			},
+			[]*Rule{
+				&Rule{TagName: "gender", Type: RuleTypeSameness, Weight: 1},
+			},
+			[]*Group{
+				&Group{Name: "Group 1", MinSize: 3, MaxSize: 4},
+				&Group{Name: "Group 2", MinSize: 3, MaxSize: 4},
+			}),
+	)
+}
