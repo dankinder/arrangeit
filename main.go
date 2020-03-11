@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dankinder/handle"
 )
@@ -22,6 +24,8 @@ var minGroupSize int
 var maxGroupSize int
 var maxNumGroups int
 
+var timeoutSeconds int
+
 func init() {
 	flag.StringVar(&itemsFile, "items", "", "path to the items to arrange")
 	flag.StringVar(&rulesFile, "rules", "", "path to the rules file")
@@ -29,6 +33,7 @@ func init() {
 	flag.IntVar(&minGroupSize, "min-size", 0, "path to the rules file")
 	flag.IntVar(&maxGroupSize, "max-size", 0, "maximum size of a group")
 	flag.IntVar(&maxNumGroups, "max-groups", 0, "maximum number of groups")
+	flag.IntVar(&timeoutSeconds, "timeout-secs", 0, "after this many seconds, return the best arrangement found so far")
 }
 
 // TODO better help text
@@ -70,7 +75,14 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	arrangement, err := GetArrangement(items, rules, groups)
+	ctx := context.Background()
+	if timeoutSeconds != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Second*time.Duration(timeoutSeconds))
+		defer cancel()
+	}
+
+	arrangement, err := GetArrangement(ctx, items, rules, groups)
 	if err != nil {
 		fmt.Printf("error computing arrangement: %v\n", err)
 		os.Exit(1)

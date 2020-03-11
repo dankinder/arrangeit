@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -93,9 +94,9 @@ func (g *Group) Copy() *Group {
 	return newGroup
 }
 
-// MustGetArrangement calls GetArrangement but panics on failures.
+// MustGetArrangement calls GetArrangement but panics on failures. Good for testing.
 func MustGetArrangement(items []*Item, rules []*Rule, groups []*Group) []*Group {
-	result, err := GetArrangement(items, rules, groups)
+	result, err := GetArrangement(context.Background(), items, rules, groups)
 	if err != nil {
 		panic(fmt.Sprintf("GetArrangement failed: %v", err))
 	}
@@ -104,8 +105,9 @@ func MustGetArrangement(items []*Item, rules []*Rule, groups []*Group) []*Group 
 
 // GetArrangement is the primary workhorse of the algorithm. Given a set of items, rules, and groups to fill, it returns
 // copies of the Groups with Items filled in matching the rules.
-func GetArrangement(items []*Item, rules []*Rule, groups []*Group) ([]*Group, error) {
+func GetArrangement(ctx context.Context, items []*Item, rules []*Rule, groups []*Group) ([]*Group, error) {
 	r := runner{
+		ctx:                      ctx,
 		items:                    items,
 		rules:                    rules,
 		groups:                   groups,
@@ -174,6 +176,7 @@ func (s *State) IsTerminal() bool {
 type runner struct {
 	// Stuff to be initialized with:
 	//
+	ctx    context.Context
 	items  []*Item
 	rules  []*Rule
 	groups []*Group
@@ -214,7 +217,16 @@ func (r *runner) run() ([]*Group, error) {
 	initialState.Score = r.CalculateScore(initialState)
 
 	r.statesToTry = []*State{initialState}
+mainLoop:
 	for len(r.statesToTry) > 0 {
+
+		// Check if we've timed out. Will cause us to return the best state we have so far.
+		select {
+		case <-r.ctx.Done():
+			break mainLoop
+		default:
+		}
+
 		// Note: statesToTry is always sorted from least to greatest score potential.
 		// Start by popping off the last one
 		next := r.statesToTry[len(r.statesToTry)-1]
