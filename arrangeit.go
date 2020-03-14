@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -15,11 +14,10 @@ import (
 
 // TODO:
 //	- Implement Relationship
-//	- Input validation: fail if there are not enough slots for everyone (or make that work better)
+//	- Avoid exploring states that can't possibly meet the min-size requirements
 //	- Better heuristics
 //	- Specify sort preference for final output; e.g. to sort staff/drivers above students; and sort cars by bros then sis
 //	- Accept another data structure for groups (e.g. the cars/vans available)
-//	- Time-limiting: at time-limit, return best state
 
 // Item defines a thing or person that has a set of tags and needs to be arranged into groups.
 type Item struct {
@@ -74,8 +72,10 @@ type Group struct {
 // digest produces a unique hash digest of the group, intended such that groups that are "equivalent" (e.g. regardless
 // of ordering, treating people with identical attributes as the same, etc.) have the same digest.
 func (g *Group) digest() uint64 {
+	itemsSorted := append([]*Item(nil), g.Items...)
+	sort.Slice(itemsSorted, func(i, j int) bool { return itemsSorted[i].ID < itemsSorted[j].ID })
 	h := fnv.New64()
-	for _, item := range g.Items {
+	for _, item := range itemsSorted {
 		h.Write([]byte(item.ID))
 	}
 	return h.Sum64()
@@ -112,7 +112,7 @@ func GetArrangement(ctx context.Context, items []*Item, rules []*Rule, groups []
 		rules:                    rules,
 		groups:                   groups,
 		maxDistributionByTagName: map[string]float64{},
-		//stateCache:               map[uint64]stateCacheEntry{},
+		statesTried:              map[uint64]struct{}{},
 	}
 	return r.run()
 }
@@ -174,7 +174,7 @@ func (s *State) IsTerminal() bool {
 //
 
 type runner struct {
-	// Stuff to be initialized with:
+	// Stuff to be initialized with. Note that these slices should not be modified during the algorithm.
 	//
 	ctx    context.Context
 	items  []*Item
@@ -190,12 +190,11 @@ type runner struct {
 	// Used for caching the maximum distribution in location/nearness calculations
 	maxDistributionByTagName map[string]float64
 
-	//stateCache map[uint64]stateCacheEntry
-}
+	// Maps a state digest to the score we got for that state
+	statesTried map[uint64]struct{}
 
-type stateCacheEntry struct {
-	state *State
-	score float64
+	// For state generation, the current permutation of items we're trying
+	currentPermutation []int
 }
 
 func (r *runner) run() ([]*Group, error) {
@@ -206,59 +205,127 @@ func (r *runner) run() ([]*Group, error) {
 	r.populateNearnessTagPoints()
 	defer r.clearNearnessTagPoints()
 
-	initialState := &State{ItemsNotInGroups: r.items}
-	for _, group := range r.groups {
-		initialState.Groups = append(initialState.Groups, &Group{
-			Name:    group.Name,
-			MinSize: group.MinSize,
-			MaxSize: group.MaxSize,
-		})
-	}
-	initialState.Score = r.CalculateScore(initialState)
+	next := r.getRandomState()
+	r.bestState = next
 
-	r.statesToTry = []*State{initialState}
-mainLoop:
-	for len(r.statesToTry) > 0 {
-
-		// Check if we've timed out. Will cause us to return the best state we have so far.
-		select {
-		case <-r.ctx.Done():
-			break mainLoop
-		default:
+	for {
+		if r.quitting() {
+			break
 		}
 
-		// Note: statesToTry is always sorted from least to greatest score potential.
-		// Start by popping off the last one
-		next := r.statesToTry[len(r.statesToTry)-1]
-		r.statesToTry = r.statesToTry[:len(r.statesToTry)-1]
+		digest := next.digest()
+		if _, ok := r.statesTried[digest]; ok {
+			next = r.getRandomState()
+			if next == nil {
+				break
+			}
+			continue
+		}
+		r.statesTried[digest] = struct{}{}
 
-		// Optimization: if we can't get a better score with next than our current best, don't bother exploring it
-		if r.bestState != nil && next.Score <= r.bestState.Score {
+		bestOption := r.getBestNextStateFrom(next)
+		if bestOption.Score > next.Score {
+			// Keep exploring starting from this new best state
+			next = bestOption
 			continue
 		}
 
-		for _, s := range r.getPossibleNextStatesFrom(next) {
-			if s.IsTerminal() {
-				if r.bestState == nil {
-					r.bestState = s
-				} else if s.Score > r.bestState.Score {
-					r.bestState = s
-				}
-				continue
-			}
+		if next.Score > r.bestState.Score {
+			log.Println("Found better state")
+			r.bestState = next
+		}
 
-			// Same optimzation as above, but avoids the cost of putting it in statesToTry at all
-			if r.bestState != nil && next.Score <= r.bestState.Score {
-				continue
-			}
-			r.statesToTry = r.insertStateToTry(r.statesToTry, s)
+		// At this point we've explored `next` up to a local maximum score, now let's restart from a random spot and see
+		// if we find anything better
+		next = r.getRandomState()
+		if next == nil {
+			break
 		}
 	}
 
-	if r.bestState == nil {
-		return nil, errors.New("failed to discover any workable state")
-	}
 	return r.bestState.Groups, nil
+}
+
+func (r *runner) quitting() bool {
+	// Check if we've timed out. Will cause us to return the best state we have so far.
+	select {
+	case <-r.ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// getRandomState keeps returning different permutations of possible states.
+// It will never repeat the same state twice, and when it has exhausted all possible permutations it will return nil.
+func (r *runner) getRandomState() *State {
+	if r.currentPermutation == nil {
+		// On our first pass, use an empty permutation, which just means return the items in existing order
+		r.currentPermutation = make([]int, len(r.items))
+	} else {
+		// Increment to the next permutation
+		// For now this is a fisher-yates algorithm, as provided in https://stackoverflow.com/a/30230552
+		for i := len(r.currentPermutation) - 1; i >= 0; i-- {
+			if i == 0 || r.currentPermutation[i] < len(r.currentPermutation)-i-1 {
+				r.currentPermutation[i]++
+				break
+			}
+			r.currentPermutation[i] = 0
+		}
+
+		if r.currentPermutation[0] >= len(r.currentPermutation) {
+			// This indicates we've gone through every permutation
+			return nil
+		}
+	}
+
+	nextPerm := append([]*Item{}, r.items...)
+	for i, v := range r.currentPermutation {
+		nextPerm[i], nextPerm[i+v] = nextPerm[i+v], nextPerm[i]
+	}
+
+	// Given a permutation of items now, scatter them evenly across the groups
+	s := &State{
+		Groups: make([]*Group, 0, len(r.groups)),
+	}
+	for _, group := range r.groups {
+		s.Groups = append(s.Groups, &Group{
+			Name:    group.Name,
+			MinSize: group.MinSize,
+			MaxSize: group.MaxSize,
+			Items:   make([]*Item, 0, len(r.items)/len(r.groups)),
+		})
+	}
+
+	// First, ensure every group has at least MinSize number of items
+	i := 0
+	for _, group := range s.Groups {
+		for i < len(nextPerm) && len(group.Items) < group.MinSize {
+			group.Items = append(group.Items, nextPerm[i])
+			i++
+		}
+	}
+
+	// Now add people to groups round-robin
+	for i < len(nextPerm) {
+		for _, group := range s.Groups {
+			// NOTE: this could loop forever if there isn't enough room for everyone; but we have validation to ensure
+			// that can't happen
+			if len(group.Items) == group.MaxSize {
+				// This group is maxed, we can't try putting another in it
+				continue
+			}
+
+			group.Items = append(group.Items, nextPerm[i])
+			i++
+			if i >= len(nextPerm) {
+				break
+			}
+		}
+	}
+	s.Score = r.CalculateScore(s)
+
+	return s
 }
 
 func (r *runner) validateInput() error {
@@ -272,69 +339,74 @@ func (r *runner) validateInput() error {
 	return nil
 }
 
-func (r *runner) populateNearnessTagPoints() {
-	for _, rule := range r.rules {
-		if rule.Weight == 0 || rule.Type != RuleTypeNearness {
-			continue
-		}
+func (r *runner) getBestNextStateFrom(sourceState *State) *State {
+	// NOTE: we'd quit faster by checking `quitting()` in the loop here, but would also slow us down
 
-		for _, item := range r.items {
-			val := item.Tags[rule.TagName]
-			if val == "" {
-				continue
-			}
+	// Here we loop through all items, trying all the possible ways we can move them around.
+	// For groups that aren't maxed out, we just try moving the item into the group.
+	// For groups that are maxed we need to try swapping our item with one already in the group.
 
-			p, err := r.parsePoint(val)
-			if err != nil {
-				// When we calculate the total distribution we'll log these, so don't do it here, just skip
-				continue
-			}
+	bestOption := sourceState
+	// Copy the sourceState, so we aren't messing with it as we move stuff around in `s`
+	s := sourceState.Copy()
 
-			if item.nearnessTags == nil {
-				item.nearnessTags = map[string]point{}
+	for gIndex1 := range s.Groups {
+		for i := 0; i < len(s.Groups[gIndex1].Items); i++ {
+
+			for gIndex2 := range s.Groups {
+
+				// We need to redefine tehse every loop iteration because below, we mess with the groups
+				g1, g2 := s.Groups[gIndex1], s.Groups[gIndex2]
+
+				if g1 == g2 {
+					continue
+				}
+
+				if len(g2.Items) < g2.MaxSize {
+					// The group isn't full yet, try moving our current item into it
+					origG1Items := g1.Items
+					origG2Items := g2.Items
+
+					// NOTE: we don't need to make a copy of this since we aren't modifying any of the cells it points to
+					g2.Items = append(g2.Items, g1.Items[i])
+
+					// Make a copy of g1.Items and delete the item by overwriting it with the last item
+					g1.Items = append([]*Item(nil), g1.Items...)
+					g1.Items[i] = g1.Items[len(g1.Items)-1]
+					g1.Items = g1.Items[:len(g1.Items)-1]
+
+					s.Score = r.CalculateScore(s)
+					if s.Score > bestOption.Score {
+						bestOption = s
+						s = sourceState.Copy()
+					} else {
+						// We're going to reuse s, so restore it to how it was
+						g1.Items = origG1Items
+						g2.Items = origG2Items
+					}
+
+				} else {
+					// This group is full, so we need to try a swap with each person in it
+					// TODO: currently we waste effort since if 2 groups are full, we'll try swapping every person in
+					// each with the other, twice. We should change this to try swapping people from earlier groups with
+					// later groups, but not vice versa.
+					for i2 := 0; i2 < len(g2.Items); i2++ {
+						g1.Items[i], g2.Items[i2] = g2.Items[i2], g1.Items[i]
+
+						s.Score = r.CalculateScore(s)
+						if s.Score > bestOption.Score {
+							bestOption = s
+							s = sourceState.Copy()
+						} else {
+							// We're going to reuse s, so restore it to how it was
+							g1.Items[i], g2.Items[i2] = g2.Items[i2], g1.Items[i]
+						}
+					}
+				}
 			}
-			item.nearnessTags[rule.TagName] = p
 		}
 	}
-}
-
-// clearNearnessTagPoints blows away item.nearnessTags so that in the tests we can use assert.Equals on Item objects
-// easily.
-func (r *runner) clearNearnessTagPoints() {
-	for _, item := range r.items {
-		item.nearnessTags = nil
-	}
-}
-
-func (r *runner) getPossibleNextStatesFrom(s *State) []*State {
-	// Indicates whether we've tried adding the next person to a new empty group. If we have, we shouldn't try it again
-	// with a different empty group, since those arrangements would be the same. This assumes all the groups have the
-	// same min and max sizes; we may have to undo that assumption at some point.
-	triedEmptyGroup := false
-
-	var nextStates []*State
-	for i, group := range s.Groups {
-		if len(group.Items) == group.MaxSize {
-			// This group is maxed, we can't try putting another in it
-			continue
-		}
-
-		if len(s.Groups[i].Items) == 0 {
-			if triedEmptyGroup {
-				continue
-			}
-			triedEmptyGroup = true
-		}
-
-		// Copy the state to ensure we don't modify data that will affect parent calls
-		newState := s.Copy()
-		itemToAdd := newState.ItemsNotInGroups[0]
-		newState.ItemsNotInGroups = newState.ItemsNotInGroups[1:]
-		newState.Groups[i].Items = append(newState.Groups[i].Items, itemToAdd)
-		newState.Score = r.CalculateScore(newState)
-		nextStates = append(nextStates, newState)
-	}
-	return nextStates
+	return bestOption
 }
 
 // insertStateToTry adds in the new state while maintaining that states is sorted from highest to lowest score
@@ -386,12 +458,9 @@ func (r *runner) CalculateCurrentScore(s *State) float64 {
 					tagOccurrencesInGroup[val]++
 				}
 				for _, count := range tagOccurrencesInGroup {
-					// We want to subtract 1 here because we only want to add to the score if at least 2 people actually
-					// share the same tag value.
-					score += float64(rule.Weight * (count - 1))
-
-					// TODO(dk): consider a more complicated algorithm that rewards more by giving 1 point for each
-					// pair of people, i.e. "N choose 2". Probably over-weights it though.
+					// Increase the score by count squared in order to prefer that many people with the same tag be
+					// together.
+					score += float64(rule.Weight) * math.Pow(float64(count), 2)
 				}
 			}
 		case RuleTypeRelationship:
@@ -491,7 +560,7 @@ func (r *runner) CalculateMaxPotentialScore(s *State) float64 {
 				distribution float64
 				slotsLeft    int
 			}
-			var groupsToFill []groupToFill
+			groupsToFill := make([]groupToFill, 0, len(s.Groups))
 			for _, group := range s.Groups {
 				distribution, _ := getGroupDistribution(group, rule.TagName)
 				slotsLeft := group.MaxSize - len(group.Items)
@@ -548,16 +617,76 @@ func (r *runner) parsePoint(str string) (point, error) {
 	return p, nil
 }
 
-// getGroupDistribution returns the distribution of the points in the provided group (see getDistribution) along with
-// the number of points there are.
-func getGroupDistribution(group *Group, tagName string) (float64, int) {
-	points := make([]point, 0, len(group.Items))
-	for _, item := range group.Items {
-		if p, ok := item.nearnessTags[tagName]; ok {
-			points = append(points, p)
+func (r *runner) populateNearnessTagPoints() {
+	for _, rule := range r.rules {
+		if rule.Weight == 0 || rule.Type != RuleTypeNearness {
+			continue
+		}
+
+		for _, item := range r.items {
+			val := item.Tags[rule.TagName]
+			if val == "" {
+				continue
+			}
+
+			p, err := r.parsePoint(val)
+			if err != nil {
+				// When we calculate the total distribution we'll log these, so don't do it here, just skip
+				continue
+			}
+
+			if item.nearnessTags == nil {
+				item.nearnessTags = map[string]point{}
+			}
+			item.nearnessTags[rule.TagName] = p
 		}
 	}
-	return getDistribution(points), len(points)
+}
+
+// clearNearnessTagPoints blows away item.nearnessTags so that in the tests we can use assert.Equals on Item objects
+// easily.
+func (r *runner) clearNearnessTagPoints() {
+	for _, item := range r.items {
+		item.nearnessTags = nil
+	}
+}
+
+// getGroupDistribution returns the distribution of the points in the provided group (see getDistribution) along with
+// the number of points there are. It copies some of getDistribution for performance reasons.
+func getGroupDistribution(group *Group, tagName string) (float64, int) {
+	var maxX, maxY, minX, minY float64
+	var numPoints int
+
+	for _, item := range group.Items {
+		if p, ok := item.nearnessTags[tagName]; ok {
+			if numPoints > 0 {
+				if p.x > maxX {
+					maxX = p.x
+				}
+				if p.x < minX {
+					minX = p.x
+				}
+				if p.y > maxY {
+					maxY = p.y
+				}
+				if p.y < minY {
+					minY = p.y
+				}
+			} else {
+				maxX = p.x
+				minX = p.x
+				maxY = p.y
+				minY = p.y
+			}
+			numPoints++
+		}
+	}
+
+	if numPoints > 0 {
+		return (maxX - minX) + (maxY - minY), numPoints
+	} else {
+		return 0, numPoints
+	}
 }
 
 // getDistribution calculates how distributed the provided points are.

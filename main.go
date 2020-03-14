@@ -8,12 +8,11 @@ import (
 	"log"
 	"os"
 	"runtime/pprof"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/dankinder/handle"
+	"github.com/jedib0t/go-pretty/table"
 )
 
 var itemsFile string
@@ -88,19 +87,37 @@ func main() {
 		os.Exit(1)
 	}
 
-	for _, group := range arrangement {
-		fmt.Println("---")
-		fmt.Println(group.Name)
-		for _, item := range group.Items {
-			var tags []string
-			for tagName, tagValue := range item.Tags {
-				tags = append(tags, fmt.Sprintf("%s=%s", tagName, tagValue))
-			}
-			sort.Strings(tags)
-			fmt.Printf("    - %s (%s)\n", item.ID, strings.Join(tags, " "))
+	tw := table.NewWriter()
 
-		}
+	header := table.Row{"Group", "Item"}
+	for _, rule := range rules {
+		header = append(header, rule.TagName)
 	}
+	tw.AppendHeader(header)
+
+	for _, group := range arrangement {
+		for _, item := range group.Items {
+			row := table.Row{group.Name, item.ID}
+			for _, tagName := range header[2:] {
+				row = append(row, item.Tags[tagName.(string)])
+			}
+			tw.AppendRow(row)
+		}
+		tw.AppendRow(table.Row{""})
+
+		//fmt.Println("---")
+		//fmt.Println(group.Name)
+		//for _, item := range group.Items {
+		//	var tags []string
+		//	for tagName, tagValue := range item.Tags {
+		//		tags = append(tags, fmt.Sprintf("%s=%s", tagName, tagValue))
+		//	}
+		//	sort.Strings(tags)
+		//	fmt.Printf("    - %s\t(%s)\n", item.ID, strings.Join(tags, "\t"))
+
+		//}
+	}
+	fmt.Println(tw.Render())
 }
 
 func getRecords(csvPath string) [][]string {
